@@ -1,0 +1,8 @@
+name: plasma-example
+dependencies:
+  - python=3.7
+  - numpy
+  - pandas
+  - pyarrow
+  - scikit-learn
+
