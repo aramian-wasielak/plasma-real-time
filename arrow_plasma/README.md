@@ -1,5 +1,8 @@
 # Real-Time Messaging with In-Memory Plasma Store
 
+A High-Performance Shared-Memory Object Store
+Motivating Plasma
+
 This code demonstrates how to efficiently distribute real-time messages using [the Apache Arrow Plasma][1] in-memory object store.
 
 Please note that **the Plasma API is under active development and it is currently (as of 2020/05) not stable**.
