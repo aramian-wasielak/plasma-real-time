@@ -15,25 +15,26 @@ import subprocess
 import time
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.plasma as plasma
+from sklearn.linear_model import SGDRegressor
 
 PLASMA_STORE_LOCATION = "/tmp/store"
 PLASMA_STORE_SIZE_BYTES = 1 * 10 ** 9  # 1 GB
 PLASMA_OBJID_SIZE_BYTES = 20
 
 # Producer related values
-NUM_COLS = 4
 NUM_ROWS = 10000
 RANDOM_SEED = 1234
 BATCH_MAX_ROWS = 40
 
 # Consumer related values
-NUM_CONSUMERS = 10
+NUM_CONSUMERS = 3
 CONSUMER_TIMEOUT_MS = 1000
 
 
-def gen_object_id(batch_num):
+def get_object_id(batch_num):
     """Generates an object id used by the plasma store for a given batch number.
 
     Args:
@@ -45,7 +46,40 @@ def gen_object_id(batch_num):
     return plasma.ObjectID(batch_num.to_bytes(PLASMA_OBJID_SIZE_BYTES, byteorder="big"))
 
 
-def calc_data_checksum(checksum, data):
+def put_df(client, object_num, df):
+    """Saves a data frame into the plasma store.
+
+    Code adjusted from:
+    https://github.com/apache/arrow/blob/master/python/examples/plasma/sorting/sort_df.py
+
+    Args:
+        client: Plasma store connection.
+        object_num (int): Object number to be used to generate a corresponding object id.
+        df (pandas): Data frame to be saved.
+    """
+    record_batch = pa.RecordBatch.from_pandas(df)
+
+    # Get size of record batch and schema
+    mock_sink = pa.MockOutputStream()
+    stream_writer = pa.RecordBatchStreamWriter(mock_sink, record_batch.schema)
+    stream_writer.write_batch(record_batch)
+    data_size = mock_sink.size()
+
+    # Generate an ID and allocate a buffer in the object store for the
+    # serialized DataFrame
+    object_id = get_object_id(object_num)
+    buf = client.create(object_id, data_size)
+
+    # Write the serialized DataFrame to the object store
+    sink = pa.FixedSizeBufferWriter(buf)
+    stream_writer = pa.RecordBatchStreamWriter(sink, record_batch.schema)
+    stream_writer.write_batch(record_batch)
+
+    # Seal the object
+    client.seal(object_id)
+
+
+def get_data_checksum(checksum, data):
     """Calculates the data checksum and adds it to the running checksum.
 
     Args:
@@ -55,22 +89,31 @@ def calc_data_checksum(checksum, data):
     Returns:
         int: The checksum value.
     """
-    return checksum + sum(sum(data))
+    return checksum + np.sum(np.sum(data))
 
 
-def gen_random_data(num_rows, num_cols, seed):
-    """Generate random data.
+def get_random_data(num_points, seed):
+    """Generate linear-looking data.
 
     Args:
-        num_rows (int): Number of rows to be generated.
-        num_cols (int): Number of columns to be generated.
+        num_points (int): Number of points to be generated.
         seed (int): Seed for the random generator.
 
     Returns:
         numpy: Generated random data.
     """
     np.random.seed(seed)
-    return np.random.rand(num_rows, num_cols)
+
+    a_0 = 4
+    a_1 = 3
+    logging.info(
+        "Simulating linear-looking data these coefficients (plus some error): a = [%f, %f]",
+        a_0, a_1)
+
+    x = 10 * np.random.rand(num_points)
+    y = a_0 + a_1 * x + np.random.randn(num_points)
+    df = pd.DataFrame(data={'x': x, 'y': y})
+    return df
 
 
 def producer(data, batch_max_rows=BATCH_MAX_ROWS):
@@ -93,24 +136,16 @@ def producer(data, batch_max_rows=BATCH_MAX_ROWS):
     while row_num < len(data):
         k = random.randint(1, batch_max_rows)
         rows = data[row_num: row_num + k]
-        checksum = calc_data_checksum(checksum, rows)
+        checksum = get_data_checksum(checksum, rows)
 
-        object_id = gen_object_id(batch_num)
-
-        logging.debug("Producer: storing batch number '%i' as object id '%s'", batch_num, object_id)
-
-        tensor = pa.Tensor.from_numpy(rows)
-        data_size = pa.get_tensor_size(tensor)
-        buf = client.create(object_id, data_size)
-
-        stream = pa.FixedSizeBufferWriter(buf)
-        pa.write_tensor(tensor, stream)
-        client.seal(object_id)
+        logging.debug("Producer: storing batch number: %i", batch_num)
+        put_df(client, batch_num, rows)
 
         row_num += k
         batch_num += 1
 
-    logging.info("Producer: total %i rows distributed (checksum: %i)", len(data), checksum)
+    client.disconnect()
+    logging.info("Producer: total %i rows distributed (checksum: %f)", len(data), checksum)
     return checksum
 
 
@@ -128,33 +163,48 @@ def consumer(cid, timeout=CONSUMER_TIMEOUT_MS):
     logging.info("Consumer %i: connecting to the plasma store", cid)
     client = plasma.connect(PLASMA_STORE_LOCATION)
 
+    model = SGDRegressor()
+
     batch_num = 0
     row_cnt = 0
-    checksum = 0.0
+    checksum = 0
     while True:
-        object_id = gen_object_id(batch_num)
+        object_id = get_object_id(batch_num)
         logging.debug("Consumer %i: retrieving object id '%s'", cid, object_id)
-        [buf2] = client.get_buffers([object_id], timeout)
-        if not buf2:
-            # This means that we hit the timeout condition. Normally we would check if we should
+
+        [data] = client.get_buffers([object_id], timeout)
+        if not data:
+            # This means we hit the timeout condition. Normally we would check if we should
             # continue to poll the plasma store for more data, but in our case we will just return.
-            logging.info("Consumer %i: total %i rows processed (checksum: %i)", cid, row_cnt, checksum)
+            client.disconnect()
+            logging.info("Consumer %i: total %i rows processed (checksum: %f)",
+                         cid, row_cnt, checksum)
+            logging.info("Consumer %i: calculated linear coefficients: a = [%f, %f]",
+                         cid, model.intercept_, model.coef_)
             break
 
-        reader = pa.BufferReader(buf2)
-        tensor = pa.read_tensor(reader).to_numpy()
-        logging.debug("Consumer %i: processing data: %s", cid, tensor)
-        checksum = calc_data_checksum(checksum, tensor)
-        row_cnt += len(tensor)
+        buffer = pa.BufferReader(data)
+        reader = pa.RecordBatchStreamReader(buffer)
+        record_batch = reader.read_next_batch()
+        df = record_batch.to_pandas()
+
+        logging.debug("Consumer %i: processing data:\n%s", cid, df)
+
+        # Incremental model training
+        x = df['x'].to_numpy().reshape(-1, 1)
+        y = df['y'].to_numpy()
+        model.partial_fit(x, y)
+
+        checksum = get_data_checksum(checksum, df)
+        row_cnt += len(df)
+
         batch_num += 1
 
     return checksum
 
 
 def main():
-    """Sets up the plasma store and simulates writing (by a producer process) and readying
-    (by consumer processes) of real-time messages.
-    """
+    """Starts up a plasma store instance and runs one producer and multiple consumer processes."""
     logging.basicConfig(level=logging.INFO)
 
     # Start the plasma store.
@@ -169,14 +219,14 @@ def main():
     num_processes = NUM_CONSUMERS + 1
     pool = Pool(processes=num_processes)
 
-    data = gen_random_data(NUM_ROWS, NUM_COLS, RANDOM_SEED)
+    data = get_random_data(NUM_ROWS, RANDOM_SEED)
     producer_result = pool.map_async(producer, [data])
     consumer_result = pool.map_async(consumer, range(NUM_CONSUMERS))
 
     producer_check = producer_result.get()
     consumer_check = consumer_result.get()
 
-    # Make sure data is consistent across all consumers and the producer process.
+    # Make sure data is identical across all consumers and the producer process.
     assert len(np.unique(consumer_check)) == 1 and consumer_check[0] == producer_check
     plasma_store.kill()
 
