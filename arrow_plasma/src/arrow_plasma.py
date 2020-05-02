@@ -18,13 +18,13 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.plasma as plasma
 
-PLASMA_STORE_LOCATION = '/tmp/store'
+PLASMA_STORE_LOCATION = "/tmp/store"
 PLASMA_STORE_SIZE_BYTES = 1 * 10 ** 9  # 1 GB
 PLASMA_OBJID_SIZE_BYTES = 20
 
 # Producer related values
 NUM_COLS = 4
-NUM_ROWS = 1000
+NUM_ROWS = 10000
 RANDOM_SEED = 1234
 BATCH_MAX_ROWS = 40
 
@@ -62,8 +62,8 @@ def gen_random_data(num_rows, num_cols, seed):
     """Generate random data.
 
     Args:
-        num_rows (int): Number of rows.
-        num_cols (int): Number of columns.
+        num_rows (int): Number of rows to be generated.
+        num_cols (int): Number of columns to be generated.
         seed (int): Seed for the random generator.
 
     Returns:
@@ -83,16 +83,21 @@ def producer(data, batch_max_rows=BATCH_MAX_ROWS):
     Returns:
         float: The checksum value for all the input data.
     """
+    logging.info("Producer: connecting to the plasma store")
     client = plasma.connect(PLASMA_STORE_LOCATION)
 
+    logging.info("Producer: starting to load data (%i rows) onto the plasma store", len(data))
     row_num = 0
     batch_num = 0
+    checksum = 0.0
     while row_num < len(data):
         k = random.randint(1, batch_max_rows)
         rows = data[row_num: row_num + k]
+        checksum = calc_data_checksum(checksum, rows)
+
         object_id = gen_object_id(batch_num)
 
-        logging.info("Producer: storing batch number '%i' as object id '%s'", batch_num, object_id)
+        logging.debug("Producer: storing batch number '%i' as object id '%s'", batch_num, object_id)
 
         tensor = pa.Tensor.from_numpy(rows)
         data_size = pa.get_tensor_size(tensor)
@@ -105,7 +110,8 @@ def producer(data, batch_max_rows=BATCH_MAX_ROWS):
         row_num += k
         batch_num += 1
 
-    return calc_data_checksum(0, data)
+    logging.info("Producer: total %i rows distributed (checksum: %i)", len(data), checksum)
+    return checksum
 
 
 def consumer(cid, timeout=CONSUMER_TIMEOUT_MS):
@@ -123,7 +129,8 @@ def consumer(cid, timeout=CONSUMER_TIMEOUT_MS):
     client = plasma.connect(PLASMA_STORE_LOCATION)
 
     batch_num = 0
-    checksum = 0
+    row_cnt = 0
+    checksum = 0.0
     while True:
         object_id = gen_object_id(batch_num)
         logging.debug("Consumer %i: retrieving object id '%s'", cid, object_id)
@@ -131,13 +138,14 @@ def consumer(cid, timeout=CONSUMER_TIMEOUT_MS):
         if not buf2:
             # This means that we hit the timeout condition. Normally we would check if we should
             # continue to poll the plasma store for more data, but in our case we will just return.
-            logging.info("Consumer %i: data checksum: %i", cid, checksum)
+            logging.info("Consumer %i: total %i rows processed (checksum: %i)", cid, row_cnt, checksum)
             break
 
         reader = pa.BufferReader(buf2)
         tensor = pa.read_tensor(reader).to_numpy()
-        logging.debug(tensor)
+        logging.debug("Consumer %i: processing data: %s", cid, tensor)
         checksum = calc_data_checksum(checksum, tensor)
+        row_cnt += len(tensor)
         batch_num += 1
 
     return checksum
@@ -147,12 +155,12 @@ def main():
     """Sets up the plasma store and simulates writing (by a producer process) and readying
     (by consumer processes) of real-time messages.
     """
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.INFO)
 
     # Start the plasma store.
-    plasma_store = subprocess.Popen(['plasma_store',
-                                     '-s', PLASMA_STORE_LOCATION,
-                                     '-m', str(PLASMA_STORE_SIZE_BYTES)])
+    plasma_store = subprocess.Popen(["plasma_store",
+                                     "-s", PLASMA_STORE_LOCATION,
+                                     "-m", str(PLASMA_STORE_SIZE_BYTES)])
 
     # Wait for the plasma store to come up and make sure it is running.
     time.sleep(1)
@@ -161,16 +169,17 @@ def main():
     num_processes = NUM_CONSUMERS + 1
     pool = Pool(processes=num_processes)
 
-    data = gen_random_data(NUM_COLS, NUM_ROWS, RANDOM_SEED)
-    result_producer = pool.map_async(producer, [data])
-    result_consumer = pool.map_async(consumer, range(NUM_CONSUMERS))
+    data = gen_random_data(NUM_ROWS, NUM_COLS, RANDOM_SEED)
+    producer_result = pool.map_async(producer, [data])
+    consumer_result = pool.map_async(consumer, range(NUM_CONSUMERS))
 
-    producer_check = result_producer.get()
-    consumer_check = result_consumer.get()
+    producer_check = producer_result.get()
+    consumer_check = consumer_result.get()
 
+    # Make sure data is consistent across all consumers and the producer process.
     assert len(np.unique(consumer_check)) == 1 and consumer_check[0] == producer_check
     plasma_store.kill()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
