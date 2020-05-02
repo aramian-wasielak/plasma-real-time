@@ -1,4 +1,4 @@
-## Real-Time Streaming using Apache Arrow Plasma Store (Shared Memory)
+## Real-Time Streaming Example Using Shared Memory (Plasma Store) and Scikit-learn
 
 This code demonstrates how to efficiently distribute and process real-time messages using [the Apache Arrow Plasma][1] in-memory object store. We also show how we can incrementally train an online linear model using [the Scikit-learn's SGDRegressor][2].
 
