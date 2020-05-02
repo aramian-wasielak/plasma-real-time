@@ -154,7 +154,7 @@ def main():
                                      '-s', PLASMA_STORE_LOCATION,
                                      '-m', str(PLASMA_STORE_SIZE_BYTES)])
 
-    # Wait for the plasma store to come up and make sure it is running
+    # Wait for the plasma store to come up and make sure it is running.
     time.sleep(1)
     assert plasma_store.poll() is None
 
