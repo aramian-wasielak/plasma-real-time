@@ -17,9 +17,10 @@ The advantage of this approach is that the producer process is not affected by t
 Please note that **the Plasma API is under active development and it is currently (as of 2020/05) not stable**.
 
 ### Getting Started
+
 Install prerequisites:
 ```
-conda env create -f environment.yml 
+$ conda env create -f environment.yml 
 ```
 Run the example script:
 ```
