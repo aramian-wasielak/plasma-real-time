@@ -29,6 +29,7 @@ $ python src/plasma_rt_example.py
 
 ### Potential Future Improvements
 * Use a C++ client (https://github.com/apache/arrow/blob/master/cpp/apidoc/tutorials/plasma.md) to produce messages
+* Use Kalman filter for online learning
 
 ### References
 
